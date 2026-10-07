@@ -32,6 +32,13 @@ export interface TeamPreviewMessage {
   type: 'team_preview';
   own_team: PreviewMon[];
   opp_team: PreviewMon[];
+  /**
+   * Your full team data as reported by the sim (moves, stats, abilities,
+   * items) - private to you, needed by bots that reason about their own sets.
+   */
+  own_team_full: unknown;
+  /** Battle protocol lines since battle start (|split| resolved for you). */
+  public_log: string[];
 }
 
 export interface RequestMessage {
@@ -42,8 +49,11 @@ export interface RequestMessage {
    * (moves, PP, disabled flags, trapping), your full bench, and the
    * opponent's active Pokemon as publicly visible. Hidden opponent info
    * (sets, unrevealed mons' details) is never included.
+   * `rqid` is synthesized by the arena (increments per request).
    */
   observation: unknown;
+  /** Battle protocol lines since your last decision (|split| resolved for you). */
+  public_log: string[];
   time_ms: number;
 }
 

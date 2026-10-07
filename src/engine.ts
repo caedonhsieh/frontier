@@ -4,6 +4,10 @@
  *
  * Fairness-critical: the opponent's hidden information (sets, unrevealed
  * details) is NEVER serialized into a message. See buildPreview() below.
+ *
+ * Bots that maintain state across turns (Metamon's tracker, foul play's
+ * protocol parser) get the public battle log: the sim's protocol lines with
+ * |split| sections resolved per side, exactly as a Showdown client would see.
  */
 import { Battle, toID } from '@pkmn/sim';
 import { BotConnection, type ContainerOpts } from './container.js';
@@ -43,6 +47,57 @@ function safeName(id: string): string {
   return id.replace(/[|\n\r]/g, '_').slice(0, 40);
 }
 
+/* ------------------------------------------------------------------ */
+/* protocol line capture (ported from battle-dome's parity driver)     */
+/* ------------------------------------------------------------------ */
+
+interface CaptureState {
+  lines: string[];
+}
+
+/** Capture the sim's broadcast protocol lines. Requests travel via
+ *  sideupdate, not update, so |request| lines never land here. */
+function makeCapture() {
+  const state: CaptureState = { lines: [] };
+  const send = (type: string, data: string | string[]) => {
+    if (type !== 'update') return;
+    const txt = Array.isArray(data) ? data.join('\n') : data;
+    for (const line of txt.split('\n')) {
+      if (line) state.lines.push(line);
+    }
+  };
+  return { state, send };
+}
+
+/**
+ * Fresh lines for one side's view, with |split| sections resolved the way a
+ * real client sees them (|split|p1 is followed by the p1-only line, then the
+ * p2-only line).
+ */
+function takeNewLines(
+  state: CaptureState,
+  side: Slot,
+  consumed: Record<Slot, number>
+): string[] {
+  const fresh = state.lines.slice(consumed[side]);
+  consumed[side] = state.lines.length;
+  const out: string[] = [];
+  for (let i = 0; i < fresh.length; i++) {
+    const m = /^\|split\|(p[12])$/.exec(fresh[i]);
+    if (m) {
+      out.push(m[1] === side ? (fresh[i + 1] ?? '') : (fresh[i + 2] ?? ''));
+      i += 2;
+    } else {
+      out.push(fresh[i]);
+    }
+  }
+  return out.filter((l) => l !== '');
+}
+
+/* ------------------------------------------------------------------ */
+/* battle runner                                                       */
+/* ------------------------------------------------------------------ */
+
 export async function runMatch(cfg: MatchConfig): Promise<MatchResult> {
   const bots: Record<Slot, BotConnection> = {
     p1: BotConnection.launch(cfg.botA.digest, cfg.matchId, 'p1', cfg.container),
@@ -80,24 +135,53 @@ export async function runMatch(cfg: MatchConfig): Promise<MatchResult> {
       })
     );
 
-    const battle = new Battle({ formatid: toID('gen9ou'), seed: simSeed(cfg.seed) });
+    const { state: cap, send } = makeCapture();
+    const battle = new Battle({
+      formatid: toID('gen9ou'),
+      seed: simSeed(cfg.seed),
+      send,
+    } as any);
     battle.setPlayer('p1', { team: cfg.teamA, name: names.p1 });
     battle.setPlayer('p2', { team: cfg.teamB, name: names.p2 });
+    battle.sendUpdates();
 
+    const consumed: Record<Slot, number> = { p1: 0, p2: 0 };
+    const rqid: Record<Slot, number> = { p1: 0, p2: 0 };
     let forfeit: Slot | null = null;
 
+    const sideIdx = (slot: Slot): 0 | 1 => (slot === 'p1' ? 0 : 1);
+    /** This side's full team data as the sim reports it (private to the side). */
+    const ownTeamFull = (slot: Slot): unknown =>
+      JSON.parse(JSON.stringify((battle.sides[sideIdx(slot)] as any).getRequestData()));
+
     while (!battle.ended && battle.turn < maxTurns) {
-      const choices = {} as Record<Slot, string>;
+      const choices = {} as Record<Slot, string | undefined>;
       for (const slot of ['p1', 'p2'] as Slot[]) {
-        const side = battle.sides[slot === 'p1' ? 0 : 1];
-        const req: any = side.activeRequest;
+        const req: any = battle.sides[sideIdx(slot)].activeRequest;
         if (!req) {
-          choices[slot] = 'pass';
+          // No decision needed (isChoiceDone treats this as done).
+          choices[slot] = undefined;
           continue;
         }
-        choices[slot] = req.teamPreview
-          ? await teamPreviewChoice(bots[slot], battle, slot, cfg, strike)
-          : await actionChoice(bots[slot], req, battle.turn, cfg, slot, strike, moveMs);
+        if (req.wait) {
+          // Nothing to decide (e.g. mid-turn faint already resolved).
+          choices[slot] = 'default';
+          continue;
+        }
+        const publicLog = takeNewLines(cap, slot, consumed);
+        if (req.teamPreview) {
+          choices[slot] = await teamPreviewChoice(
+            bots[slot], battle, slot, publicLog, ownTeamFull(slot), cfg, strike
+          );
+        } else {
+          // Freeze the request and stamp a synthesized rqid (the sim has no
+          // rqid concept; the real server adds one).
+          const observation = JSON.parse(JSON.stringify(req));
+          observation.rqid = ++rqid[slot];
+          choices[slot] = await actionChoice(
+            bots[slot], observation, publicLog, battle.turn, cfg, slot, strike, moveMs
+          );
+        }
         if (strikes(slot) >= MAX_STRIKES) {
           forfeit = slot;
           break;
@@ -106,7 +190,9 @@ export async function runMatch(cfg: MatchConfig): Promise<MatchResult> {
       if (forfeit) break;
       // Any sim rejection here is a bug or an exploited edge case:
       // fail the match loudly rather than silently corrupting it.
-      battle.makeChoices(choices.p1, choices.p2);
+      // '' is falsy, so sides with no pending request are skipped by choose().
+      battle.makeChoices(choices.p1 ?? '', choices.p2 ?? '');
+      battle.sendUpdates();
     }
 
     let winner: Slot | null = null;
@@ -152,7 +238,7 @@ export async function runMatch(cfg: MatchConfig): Promise<MatchResult> {
 
 /**
  * Build the preview listing for one side as seen by the viewer.
- * FAIRNESS: only species/types/HP leave this function. The sim's Pokemon
+ * FAIRNESS: only species/types/HP/tera leave this function. The sim's Pokemon
  * objects carry full sets (moves, ability, item) — those must never be
  * serialized into a bot message.
  */
@@ -170,6 +256,8 @@ async function teamPreviewChoice(
   bot: BotConnection,
   battle: Battle,
   slot: Slot,
+  publicLog: string[],
+  ownTeamFull: unknown,
   cfg: MatchConfig,
   strike: (s: Slot, k: 'timeout' | 'illegal') => void
 ): Promise<string> {
@@ -178,7 +266,7 @@ async function teamPreviewChoice(
   const opp = buildPreview(battle, (1 - me) as 0 | 1);
   const fallback = `team ${own.map((_, i) => i + 1).join(', ')}`;
 
-  bot.send({ type: 'team_preview', own_team: own, opp_team: opp });
+  bot.send({ type: 'team_preview', own_team: own, opp_team: opp, own_team_full: ownTeamFull, public_log: publicLog });
   try {
     const msg = await bot.recv(cfg.moveTimeMs);
     if (msg.type !== 'lead' || !isPermutation(msg.order, own.length)) {
@@ -207,28 +295,34 @@ function isPermutation(order: unknown, n: number): order is number[] {
 
 async function actionChoice(
   bot: BotConnection,
-  req: any,
+  observation: any,
+  publicLog: string[],
   turn: number,
   cfg: MatchConfig,
   slot: Slot,
   strike: (s: Slot, k: 'timeout' | 'illegal') => void,
   moveMs: Record<Slot, number[]>
 ): Promise<string> {
-  bot.send({ type: 'request', turn, observation: req, time_ms: cfg.moveTimeMs });
+  bot.send({ type: 'request', turn, observation, public_log: publicLog, time_ms: cfg.moveTimeMs });
   const t0 = Date.now();
   try {
     const msg = await bot.recv(cfg.moveTimeMs);
     moveMs[slot].push(Date.now() - t0);
-    if (msg.type !== 'action' || typeof msg.action !== 'string' || !isLegalChoice(req, msg.action.trim())) {
+    if (msg.type !== 'action' || typeof msg.action !== 'string' || !isLegalChoice(observation, msg.action.trim())) {
       strike(slot, 'illegal');
-      return firstLegal(req);
+      return firstLegal(observation);
     }
-    return msg.action.trim();
+    return normalizeChoice(msg.action.trim());
   } catch {
     moveMs[slot].push(Date.now() - t0);
     strike(slot, 'timeout');
-    return firstLegal(req);
+    return firstLegal(observation);
   }
+}
+
+/** Normalize accepted choice spellings to the sim's canonical form. */
+function normalizeChoice(action: string): string {
+  return action.replace(/ terastallize$/, ' tera');
 }
 
 /** Structural legality check against the public request. Catches bad indexes,
@@ -237,7 +331,8 @@ function isLegalChoice(req: any, action: string): boolean {
   const active = req.active?.[0];
   if (!active) return action === 'pass';
 
-  let m = /^move (\d+)( tera)?$/.exec(action);
+  const a = normalizeChoice(action);
+  let m = /^move (\d+)( tera)?$/.exec(a);
   if (m) {
     const i = parseInt(m[1], 10) - 1;
     const move = active.moves?.[i];
@@ -245,14 +340,14 @@ function isLegalChoice(req: any, action: string): boolean {
     if (m[2] && !active.canTerastallize) return false;
     return true;
   }
-  m = /^switch (\d+)$/.exec(action);
+  m = /^switch (\d+)$/.exec(a);
   if (m) {
     if (active.trapped) return false;
     const i = parseInt(m[1], 10) - 1;
     const target = req.side?.pokemon?.[i];
     return !!target && !target.active && target.condition !== '0 fnt';
   }
-  return action === 'pass';
+  return a === 'pass';
 }
 
 function firstLegal(req: any): string {

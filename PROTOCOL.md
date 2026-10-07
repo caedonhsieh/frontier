@@ -31,13 +31,18 @@ battle seed and reveals nothing about RNG outcomes.
 {
   "type": "team_preview",
   "own_team": [{"name": "Great Tusk", "types": ["Fighting", "Ground"], "hp": 100, "maxhp": 100}],
-  "opp_team": [{"name": "Gholdengo", "types": ["Steel", "Ghost"], "hp": 100, "maxhp": 100}]
+  "opp_team": [{"name": "Gholdengo", "types": ["Steel", "Ghost"], "hp": 100, "maxhp": 100}],
+  "own_team_full": { "...": "your full team data as reported by the sim" },
+  "public_log": ["|init|battle", "|title|...", "|poke|p1|Great Tusk|", "..."]
 }
 ```
 
 Both teams as revealed at preview: species, types, HP. No movesets, abilities,
-or items for the opponent — exactly what a human sees. Your own team is listed
-in the order you'll reference in your reply.
+or items for the opponent — exactly what a human sees. `own_team_full` is your
+own full team data (moves, stats, abilities, items) — private to you, for bots
+that reason about their own sets. `public_log` carries the battle protocol
+lines since battle start, with `|split|` sections resolved for your side —
+feed these to any state tracker before deciding.
 
 ### `request`
 
@@ -46,6 +51,7 @@ in the order you'll reference in your reply.
   "type": "request",
   "turn": 12,
   "observation": { "...": "your side's public battle state" },
+  "public_log": ["|turn|12", "|move|p1a: ...", "..."],
   "time_ms": 5000
 }
 ```
@@ -53,7 +59,9 @@ in the order you'll reference in your reply.
 `observation` is your side's request object from the sim: your active Pokémon
 (moves, PP, disabled flags, trapping), your full bench, and the opponent's
 *active* Pokémon as publicly visible. Hidden opponent information is never
-included. Reply within `time_ms` or the move is forfeited to a default.
+included. `rqid` is synthesized by the arena and increments per request.
+`public_log` carries new protocol lines since your last decision.
+Reply within `time_ms` or the move is forfeited to a default.
 
 ### `battle_end`
 
@@ -84,7 +92,8 @@ Reply to `request` with a Showdown choice string:
 ```
 
 Legal actions: `move 1`–`move 4` (append ` tera` to terastallize, e.g.
-`move 1 tera`), `switch 2`–`switch 6`, `pass`. Anything else — or a move the
+`move 1 tera`; the longer ` terastallize` spelling is also accepted),
+`switch 2`–`switch 6`, `pass`. Anything else — or a move the
 sim rejects — counts as an illegal move and is replaced by a default choice.
 Three strikes (timeouts + illegal moves) forfeits the match.
 

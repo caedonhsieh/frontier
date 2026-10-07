@@ -1,0 +1,1 @@
+{"dependencies":{"onnxruntime-node":"1.30.0"},"description":"Frontier adapter for the Metamon Kadabra3 neural policy","devDependencies":{"@types/node":"^22.0.0","typescript":"^5.6.0"},"name":"frontier-metamon","private":true,"scripts":{"build":"tsc"},"type":"module","version":"0.1.0"}

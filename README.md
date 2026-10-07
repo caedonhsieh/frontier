@@ -57,6 +57,8 @@ src/
   validate.ts   # admission gauntlet for new bot images
 bots/
   random/       # reference policy: uniform-random legal moves
+  metamon/      # Metamon Kadabra3 neural policy (onnxruntime-node, CPU)
+  foulplay/     # foul play MCTS over poke-engine (headless, no Showdown server)
 PROTOCOL.md     # the full container contract bot authors implement
 ```
 
